@@ -4,8 +4,8 @@
 import { DatabaseSync } from 'node:sqlite'
 import { beforeAll, describe, expect, it } from 'vitest'
 import type { Report } from '../src/checks/types'
-import { checksLeftToday, countCheck, DAILY_CHECK_BUDGET } from '../src/worker/budget'
-import { clearWebhooks, subscribe } from '../src/worker/alerts'
+import { checksAllowedNow, DAILY_CHECK_BUDGET, DAILY_WRITE_BUDGET, recordUsage, usedToday, WriteMeter } from '../src/worker/budget'
+import { clearWebhooks, pruneEvents, subscribe } from '../src/worker/alerts'
 import { finishSignIn } from '../src/worker/oauth'
 import { consumeChallenge, createChallenge } from '../src/worker/owners'
 import { loadPrivateReport, savePrivateReport } from '../src/worker/private'
@@ -141,17 +141,40 @@ describe('registry sync', () => {
   })
 })
 
-describe('daily check budget', () => {
-  it('counts checks and starts again each day', async () => {
-    const today = new Date().toISOString().slice(0, 10)
-    raw.prepare(`INSERT INTO settings (key, value) VALUES ('checks_day', ?) ON CONFLICT (key) DO UPDATE SET value = excluded.value`).run('2020-01-01:1999')
-    expect(await checksLeftToday(DB)).toBe(DAILY_CHECK_BUDGET)
-    await countCheck(DB)
-    await countCheck(DB)
-    expect(raw.prepare(`SELECT value FROM settings WHERE key = 'checks_day'`).get()).toEqual({ value: `${today}:2` })
-    expect(await checksLeftToday(DB)).toBe(DAILY_CHECK_BUDGET - 2)
-    raw.prepare(`UPDATE settings SET value = ? WHERE key = 'checks_day'`).run(`${today}:${DAILY_CHECK_BUDGET + 5}`)
-    expect(await checksLeftToday(DB)).toBe(0)
+describe('daily budgets', () => {
+  it('spread checks evenly across the day and stop at the write budget', () => {
+    const at = (time: string) => Date.parse(`2026-11-24T${time}Z`)
+    expect(DAILY_CHECK_BUDGET).toBe(600)
+    expect(checksAllowedNow({ checks: 0, rows: 0 }, at('00:00:00'))).toBe(1)
+    expect(checksAllowedNow({ checks: 0, rows: 0 }, at('12:00:00'))).toBe(301)
+    expect(checksAllowedNow({ checks: 301, rows: 0 }, at('12:00:00'))).toBe(0)
+    expect(checksAllowedNow({ checks: 599, rows: 0 }, at('23:59:59'))).toBe(1)
+    expect(checksAllowedNow({ checks: 600, rows: 0 }, at('23:59:59'))).toBe(0)
+    expect(checksAllowedNow({ checks: 0, rows: DAILY_WRITE_BUDGET }, at('12:00:00'))).toBe(0)
+  })
+
+  it('record a run in one write (none when it did nothing), and start again each day', async () => {
+    const now = Date.now()
+    const before = await usedToday(DB, now)
+    expect(await rowsWritten(() => recordUsage(DB, before, 0, 0, now))).toBe(0)
+    expect(await rowsWritten(() => recordUsage(DB, before, 2, 40, now))).toBe(1)
+    // The record's own write counts too.
+    expect(await usedToday(DB, now)).toEqual({ checks: before.checks + 2, rows: before.rows + 41 })
+    expect(await usedToday(DB, now + 86_400_000)).toEqual({ checks: 0, rows: 0 })
+  })
+
+  it('meter every row written through them, in batches and with first()', async () => {
+    const meter = new WriteMeter()
+    const db = meter.db(DB)
+    await db.prepare(`INSERT INTO settings (key, value) VALUES ('meter_test', '1')`).run()
+    await db.batch([db.prepare(`UPDATE settings SET value = '2' WHERE key = ?1`).bind('meter_test'), db.prepare(`SELECT 1`)])
+    expect(await db.prepare(`SELECT value FROM settings WHERE key = 'meter_test'`).first('value')).toBe('2')
+    expect(await db.prepare(`SELECT value FROM settings WHERE key = 'missing'`).first('value')).toBeNull()
+    expect(meter.rows).toBe(2)
+    const env = meter.env({ DB, OTHER: 'kept' })
+    expect(env.OTHER).toBe('kept')
+    await env.DB.prepare(`DELETE FROM settings WHERE key = 'meter_test'`).run()
+    expect(meter.rows).toBe(3)
   })
 })
 
@@ -280,5 +303,17 @@ describe('webhook slot race', () => {
     ])
     expect(results.filter((r) => r.status === 'fulfilled')).toHaveLength(1)
     expect(raw.prepare(`SELECT COUNT(*) AS n FROM webhooks WHERE server_id = ? AND subscriber = 'racer'`).get(ID)).toEqual({ n: 1 })
+  })
+})
+
+describe('old alert events', () => {
+  it('are pruned by sequence, keeping recent ones', async () => {
+    const old = new Date(Date.now() - 400 * 86_400_000).toISOString()
+    const recent = new Date().toISOString()
+    // Events are only ever stamped with the time they're written, so earlier ones are older.
+    raw.prepare(`UPDATE events SET at = ?`).run(old)
+    for (const at of [old, old, recent]) raw.prepare(`INSERT INTO events (server_id, type, at) VALUES ('prune-test', 'listed', ?)`).run(at)
+    await pruneEvents(DB)
+    expect(raw.prepare(`SELECT at FROM events WHERE server_id = 'prune-test'`).all()).toEqual([{ at: recent }])
   })
 })

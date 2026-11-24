@@ -12,13 +12,13 @@ import { consumeChallenge, createChallenge, hasProof, hasProofLine, markVerified
 import { handleMcp, OWN_MCP_URL, OWN_ORIGIN, ownProofText } from './mcp-server'
 import { claimSignIn, clientMetadata, COOKIE, finishSignIn, PENDING_TTL_S, purgeExpiredSignIns, SignInError, startSignIn } from './oauth'
 import { claimAttempt, finishAttempt, nextCandidates, syncDue, syncStep, trustedRegistryLinks, type QueuedServer } from './registry'
-import { checksLeftToday, countCheck } from './budget'
+import { checksAllowedNow, overBudget, recordUsage, usedToday, WriteMeter } from './budget'
 import { rateKey, targetKey, withinLimit } from './ratelimit'
 import { directoryPage, refreshSnapshotIfDue, sitemapEntries } from './directory'
 import { looksSecret } from '../security/secret-url'
 import { refreshStatsIfDue, storedStats } from './stats'
 import { backfillToolsText, embedPending, searchServers } from './search'
-import { blockServer, canonicalUrl, dueForRecheck, listedIds, listServers, loadGrade, loadReport, PAGE_SIZE, recordFailure, saveReport, serverId, serverUrl, signReport, touch, verifyReceipt } from './store'
+import { blockServer, canonicalUrl, dueForRecheck, listedIds, listServers, loadGrade, loadReport, PAGE_SIZE, recordFailure, saveReport, serverId, serverUrl, signReport, verifyReceipt } from './store'
 import { checkTarget, reserveZone } from '../security/target'
 import { verifyTurnstile, type TurnstileEnv } from './turnstile'
 
@@ -226,7 +226,6 @@ app.get('/api/report/:id', async (c) => {
   if (!ID.test(id)) return c.json({ ok: false, error: 'not-found' }, 404)
   const found = await loadReport(c.env.DB, id)
   if (!found || (found.report.authenticated && !found.meta.listed)) return c.json({ ok: false, error: 'not-found', message: 'No report with this id.' }, 404)
-  c.executionCtx.waitUntil(touch(c.env.DB, found.meta).catch(() => {}))
   const m = found.meta
   const links = m.registry_name ? trustedRegistryLinks(m.registry_name, m.url, m.website_url, m.repository_url) : undefined
   const registry = m.registry_name ? { name: m.registry_name, description: m.description, ...links } : undefined
@@ -485,52 +484,77 @@ async function withMeta(env: Env, requestUrl: string, m: { title: string; descri
   return new Response(rewritten.body, { status: 200, headers })
 }
 
-// The cron trigger fires once a minute. Each run:
-// 1. does search upkeep (tool text for older reports, embeddings for changed servers);
-// 2. reads one page of the registry while a sync is in progress;
-// 3. checks up to CHECKERS queued servers at once, each through the Checker entrypoint, so every
-//    check is its own invocation with its own CPU budget (one run alone has 10 ms on the free plan);
-// 4. when the queue is empty, re-checks one listed server whose report is over a week old.
-// Steps 3 and 4 stop for the day once the daily check budget is spent (see budget.ts).
+// The cron trigger fires every five minutes. Each run, while today's budgets last (see budget.ts):
+// 1. embeds changed servers for search;
+// 2. once an hour: tool text for older reports, the stats and directory snapshot when due, expired
+//    sign-ins and private links, MCP Check's own server; and once a day, old alert events;
+// 3. reads one page of the registry while a (weekly) sync is in progress;
+// 4. runs the checks the day's pace allows, up to CHECKERS at once, each through the Checker
+//    entrypoint so every check has its own CPU budget (one run alone has 10 ms on the free plan);
+//    when the queue is empty, re-checks the listed server with the oldest report instead.
+// Everything it writes goes through a WriteMeter; at the end the run records its checks and rows.
 const CHECKERS = 4
 
-async function tick(env: Env) {
-  // Search upkeep first: fill in derived columns for older reports (in its own invocation, since
-  // unpacking reports takes CPU), and embed changed servers.
-  const backfill = env.CHECKER ? env.CHECKER.backfill() : backfillToolsText(env.DB)
-  await Promise.resolve(backfill).then(
-    (n) => n && console.log('backfilled', n),
-    (err) => console.error('backfill failed', String(err)),
-  )
-  await embedPending(env).then(
-    (n) => n && console.log('embedded', n),
-    (err) => console.error('embedding failed', String(err)),
-  )
-  await refreshStatsIfDue(env.DB).catch((err) => console.error('stats failed', String(err)))
-  await refreshSnapshotIfDue(env.DB, OWN_MCP_URL).catch((err) => console.error('directory snapshot failed', String(err)))
-  await purgeExpiredSignIns(env.DB).catch((err) => console.error('sign-in purge failed', String(err)))
-  await purgeExpiredPrivateReports(env.DB).catch((err) => console.error('private report purge failed', String(err)))
-  await checkOwnServer(env).catch((err) => console.error('own server check failed', String(err)))
-  if (await syncDue(env.DB)) {
-    await syncStep(env.DB).then(
-      (step) => console.log('registry sync', step),
-      (err) => console.error('registry sync failed', String(err)),
+async function tick(rawEnv: Env) {
+  const used = await usedToday(rawEnv.DB)
+  if (overBudget(used)) return console.log('daily write budget used', used.rows)
+  const meter = new WriteMeter()
+  const env = meter.env(rawEnv)
+  const now = new Date()
+  const hourly = now.getUTCMinutes() < 5
+  let checks = 0
+  try {
+    await embedPending(env).then(
+      (n) => n && console.log('embedded', n),
+      (err) => console.error('embedding failed', String(err)),
     )
+    if (hourly) {
+      // Unpacking older reports takes CPU, so it runs in its own invocation.
+      const backfill = env.CHECKER ? env.CHECKER.backfill() : backfillToolsText(env.DB).then((n) => ({ n, rows: 0 }))
+      await Promise.resolve(backfill).then(
+        (r) => {
+          meter.rows += r.rows
+          if (r.n) console.log('backfilled', r.n)
+        },
+        (err) => console.error('backfill failed', String(err)),
+      )
+      await refreshStatsIfDue(env.DB).catch((err) => console.error('stats failed', String(err)))
+      await refreshSnapshotIfDue(env.DB, OWN_MCP_URL).catch((err) => console.error('directory snapshot failed', String(err)))
+      await purgeExpiredSignIns(env.DB).catch((err) => console.error('sign-in purge failed', String(err)))
+      await purgeExpiredPrivateReports(env.DB).catch((err) => console.error('private report purge failed', String(err)))
+      await checkOwnServer(env).catch((err) => console.error('own server check failed', String(err)))
+      if (now.getUTCHours() === 0) await pruneEvents(env.DB).catch((err) => console.error('event prune failed', String(err)))
+    }
+    if (await syncDue(env.DB)) {
+      await syncStep(env.DB).then(
+        (step) => console.log('registry sync', step),
+        (err) => console.error('registry sync failed', String(err)),
+      )
+    }
+    // Webhook deliveries, in their own invocation.
+    const alerts = env.CHECKER ? env.CHECKER.deliverAlerts() : deliverPending(env.DB, SITE_ORIGIN).then((n) => ({ n, rows: 0 }))
+    const allowed = checksAllowedNow(used)
+    if (allowed > 0) {
+      // Without the binding (tests, misconfiguration), check one server in this run instead.
+      const checker = env.CHECKER
+      const runs = checker
+        ? Array.from({ length: Math.min(CHECKERS, allowed) }, () => checker.checkNext())
+        : [checkNext(env).then((checked) => ({ checked, rows: 0 }))]
+      const results = await Promise.all(runs.map((r) => Promise.resolve(r).catch((err) => (console.error('checker failed', String(err)), { checked: false, rows: 0 }))))
+      for (const r of results) meter.rows += r.rows
+      checks = results.filter((r) => r.checked).length
+      if (!checks) checks = await recheck(env)
+    }
+    await Promise.resolve(alerts).then(
+      (r) => {
+        meter.rows += r.rows
+        if (r.n) console.log('alerts delivered', r.n)
+      },
+      (err) => console.error('alerts failed', String(err)),
+    )
+  } finally {
+    await recordUsage(rawEnv.DB, used, checks, meter.rows).catch((err) => console.error('usage record failed', String(err)))
   }
-  // Webhook deliveries, in their own invocation.
-  const alerts = env.CHECKER ? env.CHECKER.deliverAlerts() : deliverPending(env.DB, SITE_ORIGIN)
-  const left = await checksLeftToday(env.DB)
-  if (left > 0) {
-    // Without the binding (tests, misconfiguration), check one server in this run instead.
-    const checker = env.CHECKER
-    const runs = checker ? Array.from({ length: Math.min(CHECKERS, left) }, () => checker.checkNext()) : [checkNext(env)]
-    const checked = await Promise.all(runs.map((r) => Promise.resolve(r).catch((err) => (console.error('checker failed', String(err)), false))))
-    if (!checked.some(Boolean)) await recheck(env)
-  }
-  await Promise.resolve(alerts).then(
-    (n) => n && console.log('alerts delivered', n),
-    (err) => console.error('alerts failed', String(err)),
-  )
 }
 
 /** MCP Check's own MCP server is listed (pinned on top) and re-checked once a day. */
@@ -552,20 +576,26 @@ async function checkOwnServer(env: Env) {
 }
 
 /** Checks one queued server per call. The cron run calls it through a service binding to itself. */
+// Each method reports the rows it wrote, which count against the cron run's daily write budget.
 export class Checker extends WorkerEntrypoint<Env> {
-  async checkNext(): Promise<boolean> {
-    return checkNext(this.env)
+  async checkNext(): Promise<{ checked: boolean; rows: number }> {
+    const meter = new WriteMeter()
+    const checked = await checkNext(meter.env(this.env))
+    return { checked, rows: meter.rows }
   }
 
   /** Fill in tool text and issues for a few older reports. */
-  async backfill(): Promise<number> {
-    return backfillToolsText(this.env.DB)
+  async backfill(): Promise<{ n: number; rows: number }> {
+    const meter = new WriteMeter()
+    const n = await backfillToolsText(meter.db(this.env.DB))
+    return { n, rows: meter.rows }
   }
 
-  /** Send queued webhook deliveries, and now and then forget old events. */
-  async deliverAlerts(): Promise<number> {
-    if (Math.random() < 1 / 60) await pruneEvents(this.env.DB)
-    return deliverPending(this.env.DB, SITE_ORIGIN)
+  /** Send queued webhook deliveries. */
+  async deliverAlerts(): Promise<{ n: number; rows: number }> {
+    const meter = new WriteMeter()
+    const n = await deliverPending(meter.db(this.env.DB), SITE_ORIGIN)
+    return { n, rows: meter.rows }
   }
 }
 
@@ -573,7 +603,6 @@ export class Checker extends WorkerEntrypoint<Env> {
 async function checkNext(env: Env): Promise<boolean> {
   for (const candidate of await nextCandidates(env.DB, 4)) {
     if (await claimAttempt(env.DB, candidate)) {
-      await countCheck(env.DB)
       await checkQueued(env, candidate)
       return true
     }
@@ -595,17 +624,18 @@ async function checkQueued(env: Env, candidate: QueuedServer) {
 }
 
 // Re-check one listed server whose report is over a week old. Three failures in a row unlist it.
-async function recheck(env: Env) {
+/** Re-check the listed server with the oldest report (over a week old). Returns how many it checked. */
+async function recheck(env: Env): Promise<number> {
   const now = Date.now()
   const due = await dueForRecheck(env.DB, new Date(now - 7 * 86_400_000).toISOString(), new Date(now - 86_400_000).toISOString(), 1)
   for (const server of due) {
-    await countCheck(env.DB)
     const report = await runCheck(server.url, { vantage: VANTAGE, fetch: checkFetch(env) })
     if (report.connected || report.auth) await saveReport(env.DB, server.id, server.url, report)
     else await recordFailure(env.DB, server.id)
     await reconfirmOwner(env.DB, server.id, server.url, checkFetch(env)).catch((err) => console.error('owner reconfirm failed', String(err)))
     console.log('recheck', server.id, report.connected || report.auth ? report.grade : 'unreachable')
   }
+  return due.length
 }
 
 // Any other /api path. Registered last so it never shadows a real route.

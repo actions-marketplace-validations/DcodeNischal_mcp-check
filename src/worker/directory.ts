@@ -1,11 +1,13 @@
 // Directory pages and the sitemap read a snapshot of the directory's order, refreshed by the cron run
-// every 30 minutes and kept as a single settings row. Sorting and counting thousands of rows on every
+// every two hours and kept as a single settings row. Sorting and counting thousands of rows on every
 // request would let anyone use up the free plan's 5M rows read a day; with the snapshot, any page costs
 // about 30 row reads no matter how deep it is.
 import { ensureSchema, type DirectoryEntry } from './store'
 
-const SNAPSHOT_EVERY_MS = 30 * 60 * 1000
-const COLUMNS = 'id, url, name, grade, score, tools_count, spec_version, era, partial, auth_required, checked_at, description, owner_verified_at'
+const SNAPSHOT_EVERY_MS = 2 * 60 * 60 * 1000
+export const COLUMNS = 'id, url, name, grade, score, tools_count, spec_version, era, partial, auth_required, checked_at, description, owner_verified_at'
+/** The same columns from `s`, for queries that join servers to a list of ids. */
+export const S_COLUMNS = COLUMNS.split(', ').map((c) => `s.${c}`).join(', ')
 
 /** Listed servers in grade order: "id|grade|YYYY-MM-DD", plus the indexes of those rows by recency. */
 export interface Snapshot {
@@ -38,7 +40,7 @@ export async function refreshSnapshot(db: D1Database, excludeUrl: string): Promi
   return snap
 }
 
-/** Rebuild the snapshot if it's over 30 minutes old (from the cron run). */
+/** Rebuild the snapshot if it's over two hours old (from the cron run). */
 export async function refreshSnapshotIfDue(db: D1Database, excludeUrl: string): Promise<boolean> {
   const row = await db.prepare(`SELECT value FROM settings WHERE key = 'directory_snapshot'`).first<string>('value')
   const at = row ? Date.parse((JSON.parse(row) as Snapshot).at) : 0
@@ -59,7 +61,9 @@ export async function directoryPage(db: D1Database, q: { sort: 'grade' | 'recent
   const start = (q.page - 1) * q.pageSize
   const ids = entries.slice(start, start + q.pageSize).map((e) => e.split('|')[0]!)
   const [rows, pinned] = await db.batch([
-    db.prepare(`SELECT ${COLUMNS} FROM servers WHERE id IN (SELECT value FROM json_each(?1)) AND listed = 1 AND blocked = 0`).bind(JSON.stringify(ids)),
+    // CROSS JOIN keeps the id list as the outer loop, so each row is one primary-key lookup. With
+    // "id IN (...)" D1 preferred scanning the whole listed index: every page read every server.
+    db.prepare(`SELECT ${S_COLUMNS} FROM json_each(?1) AS j CROSS JOIN servers AS s ON s.id = j.value WHERE s.listed = 1 AND s.blocked = 0`).bind(JSON.stringify(ids)),
     db.prepare(`SELECT ${COLUMNS} FROM servers WHERE url = ?1 AND listed = 1 AND blocked = 0 ${q.grade ? 'AND grade = ?2' : ''}`).bind(...(q.grade ? [q.pinnedUrl, q.grade] : [q.pinnedUrl])),
   ])
   const byId = new Map(((rows?.results ?? []) as DirectoryEntry[]).map((r) => [r.id, r]))

@@ -3,6 +3,7 @@
 // Meaning search is optional: without the AI and VECTORS bindings, or if either fails or runs
 // out of free quota, search falls back to keywords alone.
 import type { Report } from '../checks/types'
+import { S_COLUMNS } from './directory'
 import { issuesOf } from './stats'
 import { GRADING_VERSION, regrade } from '../checks/grade'
 import { ensureSchema, gunzip, gzip, type DirectoryEntry } from './store'
@@ -150,8 +151,10 @@ export async function searchServers(env: SearchEnv, q: SearchQuery): Promise<Sea
   // Load the matches, dropping anything unlisted since it was indexed and applying the grade filter
   // to meaning matches (keyword matches were already filtered).
   const { results } = await env.DB
-    .prepare(`SELECT id, url, name, grade, score, tools_count, spec_version, era, partial, auth_required, checked_at, description, owner_verified_at, tools_text
-              FROM servers WHERE id IN (SELECT value FROM json_each(?1)) AND listed = 1 AND blocked = 0 ${q.grade ? 'AND grade = ?2' : ''}`)
+    // One primary-key lookup per match (see directoryPage for why not "id IN (...)").
+    .prepare(`SELECT ${S_COLUMNS}, s.tools_text
+              FROM json_each(?1) AS j CROSS JOIN servers AS s ON s.id = j.value
+              WHERE s.listed = 1 AND s.blocked = 0 ${q.grade ? 'AND s.grade = ?2' : ''}`)
     .bind(...(q.grade ? [JSON.stringify(ranked), q.grade] : [JSON.stringify(ranked)]))
     .all<DirectoryEntry & { tools_text: string | null }>()
   const byId = new Map(results.map((r) => [r.id, r]))

@@ -37,11 +37,20 @@ export const BASE_SCHEMA = [
   `CREATE INDEX IF NOT EXISTS servers_listed_grade ON servers (listed, grade, score DESC)`,
 ]
 
+let schemaRetryAt = 0
+
 export async function ensureSchema(db: D1Database): Promise<void> {
-  if (schemaReady) return
-  await db.batch(BASE_SCHEMA.map((sql) => db.prepare(sql)))
-  await migrate(db)
-  schemaReady = true
+  if (schemaReady || Date.now() < schemaRetryAt) return
+  try {
+    await db.batch(BASE_SCHEMA.map((sql) => db.prepare(sql)))
+    await migrate(db)
+    schemaReady = true
+  } catch (err) {
+    // Usually the account's daily write limit. Carry on with the tables as they are, so pages that
+    // only read keep working, and try again in a minute.
+    schemaRetryAt = Date.now() + 60_000
+    console.error('schema update failed, retrying in a minute:', String(err))
+  }
 }
 
 // Changes since the first deploy. Each step runs once; "duplicate column" or "already exists" means

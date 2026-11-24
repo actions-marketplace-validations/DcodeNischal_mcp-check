@@ -285,5 +285,10 @@ export async function deliverPending(db: D1Database, origin: string, limit = 10,
 
 /** Forget events older than the retention period (feeds only show recent ones anyway). */
 export async function pruneEvents(db: D1Database): Promise<void> {
-  await db.prepare(`DELETE FROM events WHERE at < ?1`).bind(new Date(Date.now() - EVENT_RETENTION_DAYS * 86_400_000).toISOString()).run()
+  // Events are numbered in time order, so the old ones are everything before the first recent one:
+  // this reads only the rows it deletes, where "WHERE at < ?" read every event.
+  await db
+    .prepare(`DELETE FROM events WHERE seq < COALESCE((SELECT seq FROM events WHERE at >= ?1 ORDER BY seq LIMIT 1), (SELECT COALESCE(MAX(seq), 0) + 1 FROM events))`)
+    .bind(new Date(Date.now() - EVENT_RETENTION_DAYS * 86_400_000).toISOString())
+    .run()
 }

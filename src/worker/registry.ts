@@ -10,7 +10,7 @@ export const REGISTRY_API = 'https://registry.modelcontextprotocol.io/v0/servers
 const PAGE_SIZE = 100 // the registry's maximum
 /** Pages read per cron run. One page uses about 7 ms of CPU, and the free plan allows 10 ms a run. */
 const PAGES_PER_RUN = 1
-const SYNC_EVERY_MS = 24 * 60 * 60 * 1000
+const SYNC_EVERY_MS = 7 * 24 * 60 * 60 * 1000
 
 export interface Candidate {
   url: string

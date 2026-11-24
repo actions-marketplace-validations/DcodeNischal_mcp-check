@@ -2,6 +2,7 @@
 
 [![MCP Check](https://mcp.nischaldhakal.com.np/badge/jh878eqit93e.svg)](https://mcp.nischaldhakal.com.np/r/jh878eqit93e)
 [![npm](https://img.shields.io/npm/v/@dcodenischal/mcp-check?label=npm&color=cb3837)](https://www.npmjs.com/package/@dcodenischal/mcp-check)
+[![MCP Check MCP connector](https://glama.ai/mcp/connectors/np.com.nischaldhakal/mcp-check/badges/score.svg)](https://glama.ai/mcp/connectors/np.com.nischaldhakal/mcp-check)
 [![CI](https://github.com/DcodeNischal/mcp-check/actions/workflows/ci.yml/badge.svg)](https://github.com/DcodeNischal/mcp-check/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 

@@ -28,15 +28,18 @@ export interface DirectoryStats {
   /** The most common warnings and failures among graded servers. */
   issues: { id: string; title: string; servers: number; failing: number }[]
   registry: Record<string, number>
+  /** When the registry was last counted (once a day: counting it reads every row). */
+  registryAt?: string
 }
 
 const LISTED = `listed = 1 AND blocked = 0`
 
-const STATS_EVERY_MS = 30 * 60 * 1000
+const STATS_EVERY_MS = 6 * 60 * 60 * 1000
+const REGISTRY_EVERY_MS = 24 * 60 * 60 * 1000
 
 /**
- * The stored stats, refreshed by the cron run every 30 minutes (counting the whole registry reads
- * thousands of rows, too many to do on every request). Computed on the spot only if none exist yet.
+ * The stored stats, refreshed by the cron run every six hours (counting reads thousands of rows,
+ * too many to do on every request). Computed on the spot only if none exist yet.
  */
 export async function storedStats(db: D1Database): Promise<DirectoryStats> {
   await ensureSchema(db)
@@ -44,22 +47,23 @@ export async function storedStats(db: D1Database): Promise<DirectoryStats> {
   return row ? (JSON.parse(row) as DirectoryStats) : refreshStats(db)
 }
 
-/** Recompute and store the stats if they're older than 30 minutes. Returns true if it did. */
+/** Recompute and store the stats if they're older than six hours. Returns true if it did. */
 export async function refreshStatsIfDue(db: D1Database): Promise<boolean> {
   const row = await db.prepare(`SELECT value FROM settings WHERE key = 'directory_stats'`).first<string>('value')
-  const at = row ? Date.parse((JSON.parse(row) as DirectoryStats).updatedAt) : 0
-  if (Date.now() - at < STATS_EVERY_MS) return false
-  await refreshStats(db)
+  const previous = row ? (JSON.parse(row) as DirectoryStats) : undefined
+  if (previous && Date.now() - Date.parse(previous.updatedAt) < STATS_EVERY_MS) return false
+  await refreshStats(db, previous)
   return true
 }
 
-async function refreshStats(db: D1Database): Promise<DirectoryStats> {
-  const stats = await directoryStats(db)
+async function refreshStats(db: D1Database, previous?: DirectoryStats): Promise<DirectoryStats> {
+  const stats = await directoryStats(db, previous)
   await db.prepare(`INSERT INTO settings (key, value) VALUES ('directory_stats', ?1) ON CONFLICT (key) DO UPDATE SET value = ?1`).bind(JSON.stringify(stats)).run()
   return stats
 }
 
-export async function directoryStats(db: D1Database): Promise<DirectoryStats> {
+export async function directoryStats(db: D1Database, previous?: DirectoryStats): Promise<DirectoryStats> {
+  const registryFresh = previous?.registryAt && Date.now() - Date.parse(previous.registryAt) < REGISTRY_EVERY_MS
   await ensureSchema(db)
   const [totals, grades, versions, issues] = await db.batch([
     db.prepare(`SELECT COUNT(*) AS listed, SUM(partial = 0) AS graded, SUM(partial) AS sign_in, SUM(partial = 0 AND issues IS NOT NULL) AS issues_base,
@@ -87,6 +91,7 @@ export async function directoryStats(db: D1Database): Promise<DirectoryStats> {
     tools: { average: Math.round((t.avg_tools ?? 0) * 10) / 10, max: t.max_tools ?? 0 },
     issuesBase: t.issues_base ?? 0,
     issues: ((issues?.results ?? []) as { check_id: string; title: string; n: number; failing: number }[]).map((r) => ({ id: r.check_id, title: r.title, servers: r.n, failing: r.failing })),
-    registry: await registryStats(db),
+    registry: registryFresh ? previous!.registry : await registryStats(db),
+    registryAt: registryFresh ? previous!.registryAt : new Date().toISOString(),
   }
 }
